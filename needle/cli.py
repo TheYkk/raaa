@@ -177,6 +177,26 @@ def main():
     p.add_argument("--save-every", type=int, default=1000,
                    help="Save and upload checkpoint every N steps (default: 1000)")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--pretrain-dataset", type=str, default=None,
+                   help="HF dataset name or local .jsonl/.json/.txt path for base pretraining")
+    p.add_argument("--pretrain-dataset-config", type=str, default=None,
+                   help="Optional HF dataset config/subset name")
+    p.add_argument("--pretrain-split", type=str, default="train",
+                   help="Dataset split to stream (default: train)")
+    p.add_argument("--pretrain-text-field", type=str, default=None,
+                   help="Raw text field for continuation pretraining (auto-falls back to 'text')")
+    p.add_argument("--pretrain-query-field", type=str, default="query",
+                   help="Seq2seq query field (default: query)")
+    p.add_argument("--pretrain-seed-field", type=str, default="query_seed_text",
+                   help="Seq2seq encoder context field (default: query_seed_text)")
+    p.add_argument("--pretrain-answer-field", type=str, default="synthetic_answer",
+                   help="Seq2seq decoder target field (default: synthetic_answer)")
+    p.add_argument("--pretrain-query-prompt", type=str, default="Continue the text.",
+                   help="Prompt used when pretraining from raw text rows")
+    p.add_argument("--shuffle-buffer", type=int, default=1000,
+                   help="Streaming dataset shuffle buffer (default: 1000)")
+    p.add_argument("--estimated-rows", type=int, default=80000000,
+                   help="Estimated rows for schedule when streaming (default: 80M)")
 
     p = sub.add_parser("tokenize", add_help=False)
     p.add_argument("--max-samples", type=int, default=None,

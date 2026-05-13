@@ -1,7 +1,8 @@
-"""Streaming pretraining on PleIAs/SYNTH dataset.
+"""Streaming base pretraining.
 
-Streams 80M examples from HuggingFace, tokenizes on-the-fly, and trains
-with simple CE loss (uniform weights). Saves needle_base.pkl every N steps.
+Streams examples from HuggingFace or local JSON/text files, tokenizes
+on-the-fly, and trains with simple CE loss (uniform weights). Saves
+needle_base.pkl every N steps.
 
 Usage:
     needle pretrain --wandb
@@ -9,6 +10,7 @@ Usage:
     needle tpu train large --name pretrain --wandb
 """
 
+import glob
 import math
 import os
 import pickle
@@ -35,8 +37,44 @@ from ..utils.distributed import _replicate, _unreplicate, shard_batch, _upload_c
 _HF_PRETRAIN_REPO = "PleIAs/SYNTH"
 
 
-def _stream_batches(tokenizer, batch_size, max_enc_len, max_dec_len, seed=42):
-    """Stream batches from PleIAs/SYNTH, tokenizing on-the-fly.
+def _load_pretrain_dataset(dataset, split, dataset_config=None, streaming=True):
+    """Load a streaming pretraining dataset from HF or local text/JSON files."""
+    from datasets import load_dataset
+
+    dataset = dataset or _HF_PRETRAIN_REPO
+    if os.path.exists(dataset):
+        if os.path.isdir(dataset):
+            json_files = sorted(
+                glob.glob(os.path.join(dataset, "*.jsonl"))
+                + glob.glob(os.path.join(dataset, "*.json"))
+            )
+            text_files = sorted(glob.glob(os.path.join(dataset, "*.txt")))
+            if json_files:
+                return load_dataset("json", data_files={"train": json_files}, split=split, streaming=streaming)
+            if text_files:
+                return load_dataset("text", data_files={"train": text_files}, split=split, streaming=streaming)
+            raise FileNotFoundError(f"No .jsonl, .json, or .txt files found in {dataset}")
+
+        ext = os.path.splitext(dataset)[1].lower()
+        if ext in (".jsonl", ".json"):
+            return load_dataset("json", data_files=dataset, split=split, streaming=streaming)
+        if ext == ".txt":
+            return load_dataset("text", data_files=dataset, split=split, streaming=streaming)
+        raise ValueError(f"Unsupported local pretrain dataset extension: {ext}")
+
+    if dataset_config:
+        return load_dataset(dataset, dataset_config, split=split, streaming=streaming)
+    return load_dataset(dataset, split=split, streaming=streaming)
+
+
+def _stream_batches(tokenizer, batch_size, max_enc_len, max_dec_len, seed=42,
+                    dataset=None, split="train", dataset_config=None,
+                    text_field=None, query_field="query",
+                    seed_field="query_seed_text",
+                    answer_field="synthetic_answer",
+                    query_prompt="Continue the text.",
+                    shuffle_buffer=1000):
+    """Stream batches from a pretraining dataset, tokenizing on-the-fly.
 
     Encoder: [query_tokens, <tools>, seed_text_tokens] truncated to max_enc_len
     Decoder input:  [EOS, answer_tokens] truncated to max_dec_len
@@ -44,16 +82,15 @@ def _stream_batches(tokenizer, batch_size, max_enc_len, max_dec_len, seed=42):
 
     Yields (enc, dec_in, dec_tgt) as numpy int32 arrays of shape (batch_size, seq_len).
     """
-    from datasets import load_dataset
-
-    ds = load_dataset(_HF_PRETRAIN_REPO, split="train", streaming=True)
+    ds = _load_pretrain_dataset(dataset, split, dataset_config=dataset_config, streaming=True)
     # Small shuffle buffer so first batch yields quickly on resume.
-    # Dataset is already split across 500 shards so it's already partially shuffled.
-    ds = ds.shuffle(seed=seed, buffer_size=1000)
+    ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
 
     tools_sep_id = TOOLS_ID
     eos_id = EOS_ID
     pad_id = PAD_ID
+    rng = np.random.RandomState(seed)
+    prompt_toks = tokenizer.encode(query_prompt)
 
     enc_batch = np.full((batch_size, max_enc_len), pad_id, dtype=np.int32)
     dec_in_batch = np.full((batch_size, max_dec_len), pad_id, dtype=np.int32)
@@ -61,33 +98,63 @@ def _stream_batches(tokenizer, batch_size, max_enc_len, max_dec_len, seed=42):
     idx = 0
 
     for example in ds:
-        query = example.get("query") or ""
-        seed_text = example.get("query_seed_text") or ""
-        answer = example.get("synthetic_answer") or ""
+        if text_field:
+            raw_text = example.get(text_field) or ""
+        else:
+            raw_text = example.get("text") or ""
 
-        if not query.strip() or not answer.strip():
-            continue
+        query = example.get(query_field) or ""
+        seed_text = example.get(seed_field) or ""
+        answer = example.get(answer_field) or ""
+        raw_text = raw_text if isinstance(raw_text, str) else str(raw_text)
+        query = query if isinstance(query, str) else str(query)
+        seed_text = seed_text if isinstance(seed_text, str) else str(seed_text)
+        answer = answer if isinstance(answer, str) else str(answer)
 
-        # Tokenize
-        q_toks = tokenizer.encode(query)
-        s_toks = tokenizer.encode(seed_text) if seed_text.strip() else []
-        a_toks = tokenizer.encode(answer)
+        if raw_text and (text_field or not answer.strip()):
+            text_toks = tokenizer.encode(raw_text)
+            max_query = max_enc_len - 2
+            q_toks = prompt_toks[:max_query]
+            max_seed = max_enc_len - len(q_toks) - 1
+            max_ans = max_dec_len - 1
+            if max_seed <= 0 or max_ans <= 0 or len(text_toks) < 2:
+                continue
+            window = max_seed + max_ans
+            if len(text_toks) > window:
+                start = int(rng.randint(0, len(text_toks) - window + 1))
+                text_toks = text_toks[start:start + window]
+            seed_len = min(max_seed, max(1, len(text_toks) // 2))
+            s_toks = text_toks[:seed_len]
+            a_toks = text_toks[seed_len:seed_len + max_ans]
+            if len(a_toks) == 0:
+                continue
+            enc_tokens = q_toks + [tools_sep_id] + s_toks
+            dec_in_tokens = [eos_id] + a_toks
+            dec_tgt_tokens = a_toks + [eos_id]
+        else:
+            if not query.strip() or not answer.strip():
+                continue
 
-        # Build encoder input: [query, <tools>, seed_text]
-        max_query = max_enc_len - 2
-        if len(q_toks) > max_query:
-            q_toks = q_toks[:max_query]
-        remaining = max_enc_len - len(q_toks) - 1
-        s_toks = s_toks[:remaining]
-        enc_tokens = q_toks + [tools_sep_id] + s_toks
+            # Tokenize
+            q_toks = tokenizer.encode(query)
+            s_toks = tokenizer.encode(seed_text) if seed_text.strip() else []
+            a_toks = tokenizer.encode(answer)
 
-        # Build decoder: input=[EOS, answer], target=[answer, EOS]
-        max_ans = max_dec_len - 1
-        a_toks = a_toks[:max_ans]
-        if len(a_toks) == 0:
-            continue
-        dec_in_tokens = [eos_id] + a_toks
-        dec_tgt_tokens = a_toks + [eos_id]
+            # Build encoder input: [query, <tools>, seed_text]
+            max_query = max_enc_len - 2
+            if len(q_toks) > max_query:
+                q_toks = q_toks[:max_query]
+            remaining = max_enc_len - len(q_toks) - 1
+            s_toks = s_toks[:remaining]
+            enc_tokens = q_toks + [tools_sep_id] + s_toks
+
+            # Build decoder: input=[EOS, answer], target=[answer, EOS]
+            max_ans = max_dec_len - 1
+            a_toks = a_toks[:max_ans]
+            if len(a_toks) == 0:
+                continue
+            dec_in_tokens = [eos_id] + a_toks
+            dec_tgt_tokens = a_toks + [eos_id]
 
         # Fill batch
         enc_batch[idx, :len(enc_tokens)] = enc_tokens
@@ -240,10 +307,11 @@ def pretrain(args):
     effective_batch_size = args.batch_size * num_devices
     global_batch_size = effective_batch_size * num_hosts
 
-    # Estimate total steps: 80M rows / global_batch_size
-    estimated_rows = 80_000_000
+    # Estimate total steps for the LR schedule. Streaming datasets often do not
+    # expose length, so this remains user-configurable for custom corpora.
+    estimated_rows = getattr(args, "estimated_rows", 80_000_000)
     max_steps = getattr(args, "max_steps", None)
-    estimated_steps = estimated_rows // global_batch_size
+    estimated_steps = max(1, estimated_rows // global_batch_size)
     if max_steps:
         estimated_steps = min(estimated_steps, max_steps)
     total_steps = estimated_steps * args.epochs
@@ -264,7 +332,10 @@ def pretrain(args):
 
     if resume_checkpoint and ckpt_data is not None:
         print(f"  Resuming from {resume_checkpoint}", flush=True)
-        ckpt_params = jax.tree.map(jnp.array, ckpt_data["params"])
+        ckpt_params = jax.tree.map(
+            lambda ckpt, ref: jnp.asarray(ckpt, dtype=ref.dtype),
+            ckpt_data["params"], state.params,
+        )
         state = state.replace(params=ckpt_params)
         del ckpt_params
         print(f"  Loaded checkpoint params", flush=True)
@@ -297,7 +368,8 @@ def pretrain(args):
         decay_steps = max(1, int(total_steps * decay_ratio))
         stable_steps = total_steps - warmup_steps - decay_steps
         print(f"\n  ─────────────────────────────────────")
-        print(f"  Pretraining on PleIAs/SYNTH")
+        pretrain_source = getattr(args, "pretrain_dataset", None) or _HF_PRETRAIN_REPO
+        print(f"  Pretraining on {pretrain_source}")
         print(f"  ─────────────────────────────────────")
         print(f"  Parameters    {param_count:>12,}")
         print(f"  d_model       {config.d_model:>12}")
@@ -324,7 +396,16 @@ def pretrain(args):
         batch_stream = _PrefetchStream(
             lambda: _stream_batches(tokenizer, global_batch_size,
                                     args.max_enc_len, args.max_dec_len,
-                                    seed=stream_seed),
+                                    seed=stream_seed,
+                                    dataset=getattr(args, "pretrain_dataset", None),
+                                    split=getattr(args, "pretrain_split", "train"),
+                                    dataset_config=getattr(args, "pretrain_dataset_config", None),
+                                    text_field=getattr(args, "pretrain_text_field", None),
+                                    query_field=getattr(args, "pretrain_query_field", "query"),
+                                    seed_field=getattr(args, "pretrain_seed_field", "query_seed_text"),
+                                    answer_field=getattr(args, "pretrain_answer_field", "synthetic_answer"),
+                                    query_prompt=getattr(args, "pretrain_query_prompt", "Continue the text."),
+                                    shuffle_buffer=getattr(args, "shuffle_buffer", 1000)),
             prefetch=8,
         )
 
