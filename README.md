@@ -99,6 +99,14 @@ needle playground
 needle finetune data.jsonl
 ```
 
+## GPU Pretraining
+
+For an NVIDIA T4, install the CUDA JAX extra and use `float16` instead of `bfloat16`:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[gpu]" && needle pretrain --name fineweb_full_b64_10k --pretrain-dataset HuggingFaceFW/fineweb-edu --pretrain-dataset-config sample-10BT --pretrain-text-field text --max-steps 10000 --estimated-rows 640000 --batch-size 64 --d-model 512 --num-heads 8 --num-kv-heads 4 --num-layers 12 --num-dec-layers 8 --max-enc-len 256 --max-dec-len 128 --save-every 500 --checkpoint-dir checkpoints/fineweb_full_b64_10k --dtype float16
+```
+
 ## CLI
 
 ```

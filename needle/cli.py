@@ -133,7 +133,7 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--decay-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--eval-every", type=int, default=1000)
@@ -170,7 +170,7 @@ def main():
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--decay-ratio", type=float, default=0.05)
     p.add_argument("--wandb", action="store_true")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-steps", type=int, default=None,
                    help="Stop after N steps (default: full epoch)")
